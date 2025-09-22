@@ -1,0 +1,5 @@
+python-telegram-bot==13.18
+openai
+requests
+flask
+stripe
