@@ -1,1 +1,2 @@
-worker: python3 scamshield_bot.py
+worker: python scamshield_bot.py
+
