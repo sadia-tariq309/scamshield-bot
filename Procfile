@@ -1,5 +1,1 @@
-python-telegram-bot==13.15
-openai==0.28
-flask==2.2.5
-stripe==5.4.0
-requests
+web: python app.py
