@@ -1,2 +1,1 @@
-worker: python scamshield_bot.py
-
+web: python app.py
