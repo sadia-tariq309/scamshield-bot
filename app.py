@@ -1,59 +1,53 @@
+from telegram.ext import Updater, CommandHandler, MessageHandler, Filters
+import openai
 import os
 import logging
-from flask import Flask, request
-from telegram import Bot, Update
-from telegram.ext import Dispatcher, CommandHandler, MessageHandler, Filters
-from telegram.ext import CallbackContext
 
-# Logging
+# Enable logging
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("scamshield")
 
-# Env vars
-TOKEN = os.environ.get("TELEGRAM_TOKEN") or os.environ.get("TG_BOT_TOKEN")
-OPENAI_KEY = os.environ.get("OPENAI_API_KEY")
+TG_TOKEN = os.getenv("TG_BOT_TOKEN") or os.getenv("TELEGRAM_TOKEN")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-if not TOKEN or not OPENAI_KEY:
-    logger.error("Missing TELEGRAM_TOKEN/TG_BOT_TOKEN or OPENAI_API_KEY")
-    exit(1)
+openai.api_key = OPENAI_API_KEY
 
-# Flask app
-app = Flask(__name__)
-
-# Telegram bot
-bot = Bot(token=TOKEN)
-dispatcher = Dispatcher(bot, None, workers=4, use_context=True)
-
-# Commands
-def start(update: Update, context: CallbackContext):
+def start(update, context):
     update.message.reply_text("👋 ScamShield AI is live and protecting you!")
 
-def upgrade(update: Update, context: CallbackContext):
+def help_cmd(update, context):
+    update.message.reply_text("ℹ️ Available commands: /start, /upgrade, or just chat with me!")
+
+def upgrade_cmd(update, context):
     update.message.reply_text("⚡ Upgrade feature coming soon!")
 
-# Handlers
-dispatcher.add_handler(CommandHandler("start", start))
-dispatcher.add_handler(CommandHandler("upgrade", upgrade))
-dispatcher.add_handler(MessageHandler(Filters.text & ~Filters.command, lambda u, c: u.message.reply_text("✅ Message received!")))
+def handle_message(update, context):
+    user_text = update.message.text
+    try:
+        # Send to OpenAI
+        response = openai.Completion.create(
+            engine="text-davinci-003",  # You can use gpt-3.5-turbo if you prefer
+            prompt=user_text,
+            max_tokens=200
+        )
+        reply = response.choices[0].text.strip()
+        update.message.reply_text(reply)
+    except Exception as e:
+        logger.error(f"OpenAI error: {e}")
+        update.message.reply_text("❌ Sorry, I had trouble processing your message.")
 
-# Webhook endpoint
-@app.route(f"/webhook/{TOKEN}", methods=["POST"])
-def webhook():
-    update = Update.de_json(request.get_json(force=True), bot)
-    dispatcher.process_update(update)
-    return "ok", 200
+def main():
+    updater = Updater(TG_TOKEN, use_context=True)
+    dp = updater.dispatcher
 
-# Health check
-@app.route("/")
-def index():
-    return "ScamShield bot is running ✅", 200
+    dp.add_handler(CommandHandler("start", start))
+    dp.add_handler(CommandHandler("help", help_cmd))
+    dp.add_handler(CommandHandler("upgrade", upgrade_cmd))
+    dp.add_handler(MessageHandler(Filters.text & ~Filters.command, handle_message))
 
-# Set webhook at startup
-with app.app_context():
-    WEBHOOK_URL = f"https://{os.environ['RENDER_EXTERNAL_HOSTNAME']}/webhook/{TOKEN}"
-    bot.delete_webhook()
-    bot.set_webhook(url=WEBHOOK_URL)
-    logger.info(f"Webhook set to {WEBHOOK_URL}")
+    updater.start_polling()
+    logger.info("Bot started (polling).")
+    updater.idle()
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
+    main()
