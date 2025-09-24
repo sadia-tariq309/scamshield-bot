@@ -1,59 +1,59 @@
 import os
 import logging
-from telegram.ext import Updater, CommandHandler, MessageHandler, Filters
+from flask import Flask, request
+from telegram import Bot, Update
+from telegram.ext import Dispatcher, CommandHandler, MessageHandler, Filters
+from telegram.ext import CallbackContext
 
-# --- Logging setup ---
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO
-)
-logger = logging.getLogger("scamshield")
+# Logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-# --- Load environment variables ---
-TG_TOKEN = os.getenv("TELEGRAM_TOKEN")  # must match Render environment name
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+# Env vars
+TOKEN = os.environ.get("TELEGRAM_TOKEN") or os.environ.get("TG_BOT_TOKEN")
+OPENAI_KEY = os.environ.get("OPENAI_API_KEY")
 
-if not TG_TOKEN or not OPENAI_API_KEY:
-    logger.error("Missing TELEGRAM_TOKEN or OPENAI_API_KEY. Please set them in Render.")
+if not TOKEN or not OPENAI_KEY:
+    logger.error("Missing TELEGRAM_TOKEN/TG_BOT_TOKEN or OPENAI_API_KEY")
     exit(1)
 
+# Flask app
+app = Flask(__name__)
 
-# --- Handlers ---
-def start(update, context):
-    update.message.reply_text("✅ Hello! ScamShield Bot is online. Use /help for commands.")
+# Telegram bot
+bot = Bot(token=TOKEN)
+dispatcher = Dispatcher(bot, None, workers=4, use_context=True)
 
+# Commands
+def start(update: Update, context: CallbackContext):
+    update.message.reply_text("👋 ScamShield AI is live and protecting you!")
 
-def help_cmd(update, context):
-    update.message.reply_text("ℹ️ Available commands:\n/start - Start bot\n/help - Show this message\n/upgrade - Coming soon!")
+def upgrade(update: Update, context: CallbackContext):
+    update.message.reply_text("⚡ Upgrade feature coming soon!")
 
+# Handlers
+dispatcher.add_handler(CommandHandler("start", start))
+dispatcher.add_handler(CommandHandler("upgrade", upgrade))
+dispatcher.add_handler(MessageHandler(Filters.text & ~Filters.command, lambda u, c: u.message.reply_text("✅ Message received!")))
 
-def upgrade_cmd(update, context):
-    update.message.reply_text("⚡ Upgrade feature is under development.")
+# Webhook endpoint
+@app.route(f"/webhook/{TOKEN}", methods=["POST"])
+def webhook():
+    update = Update.de_json(request.get_json(force=True), bot)
+    dispatcher.process_update(update)
+    return "ok", 200
 
+# Health check
+@app.route("/")
+def index():
+    return "ScamShield bot is running ✅", 200
 
-def handle_message(update, context):
-    text = update.message.text
-    update.message.reply_text(f"🤖 You said: {text}")
-
-
-# --- Main bot setup ---
-def main():
-    updater = Updater(TG_TOKEN, use_context=True)
-    dp = updater.dispatcher
-
-    # Command handlers
-    dp.add_handler(CommandHandler("start", start))
-    dp.add_handler(CommandHandler("help", help_cmd))
-    dp.add_handler(CommandHandler("upgrade", upgrade_cmd))
-
-    # Fallback text handler
-    dp.add_handler(MessageHandler(Filters.text & ~Filters.command, handle_message))
-
-    # Start polling
-    updater.start_polling()
-    logger.info("✅ Bot started (polling).")
-    updater.idle()
-
+# Set webhook at startup
+with app.app_context():
+    WEBHOOK_URL = f"https://{os.environ['RENDER_EXTERNAL_HOSTNAME']}/webhook/{TOKEN}"
+    bot.delete_webhook()
+    bot.set_webhook(url=WEBHOOK_URL)
+    logger.info(f"Webhook set to {WEBHOOK_URL}")
 
 if __name__ == "__main__":
-    main()
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
