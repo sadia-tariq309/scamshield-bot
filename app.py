@@ -1,78 +1,80 @@
-import logging
 import os
-import requests
+import logging
 from flask import Flask, request
-from telegram import Bot, Update
-from telegram.ext import Dispatcher, CommandHandler, MessageHandler, Filters
+from telegram import Update
+from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, CallbackContext, Dispatcher
+import openai
 
-# Logging
+# Logging setup
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("scamshield")
 
-# Load token
-TOKEN = os.environ.get("TG_BOT_TOKEN") or os.environ.get("TELEGRAM_TOKEN")
-if not TOKEN:
-    raise ValueError("No Telegram bot token found in environment variables!")
+# === ENV VARS ===
+BOT_TOKEN = os.environ.get("TG_BOT_TOKEN") or os.environ.get("TELEGRAM_TOKEN")
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 
-bot = Bot(token=TOKEN)
+if not BOT_TOKEN or not OPENAI_API_KEY:
+    logger.error("Missing env vars: TG_BOT_TOKEN / TELEGRAM_TOKEN, OPENAI_API_KEY")
+    raise SystemExit("❌ Missing required environment variables.")
 
-# Webhook URL (Render gives your app a public hostname automatically)
-WEBHOOK_URL = f"https://{os.environ.get('RENDER_EXTERNAL_HOSTNAME')}/webhook/{TOKEN}"
+openai.api_key = OPENAI_API_KEY
 
-# Flask app
+# === Flask App ===
 app = Flask(__name__)
 
-# === Register webhook on startup ===
-def set_webhook():
-    url = f"https://api.telegram.org/bot{TOKEN}/setWebhook?url={WEBHOOK_URL}"
-    resp = requests.get(url)
-    logger.info(f"Webhook set response: {resp.json()}")
-    return resp.json()
+# === Telegram Bot Setup ===
+updater = Updater(token=BOT_TOKEN, use_context=True)
+dispatcher: Dispatcher = updater.dispatcher
 
-set_webhook()  # call it once when app starts
+# === Handlers ===
+def start(update: Update, context: CallbackContext):
+    update.message.reply_text("👋 Hi! I’m ScamShield AI. Send me any message and I’ll check if it looks suspicious or just chat with you smartly.")
 
+def upgrade(update: Update, context: CallbackContext):
+    update.message.reply_text("⚡ Upgrade feature coming soon! (Stripe config needed).")
 
-# === Telegram Dispatcher ===
-dispatcher = Dispatcher(bot, None, workers=0)
+def handle_message(update: Update, context: CallbackContext):
+    user_message = update.message.text
+    try:
+        # Call OpenAI for AI response
+        response = openai.ChatCompletion.create(
+            model="gpt-3.5-turbo",
+            messages=[
+                {"role": "system", "content": "You are ScamShield AI, a helpful assistant that warns about scams and also chats like a smart friend."},
+                {"role": "user", "content": user_message}
+            ]
+        )
+        ai_reply = response["choices"][0]["message"]["content"]
+    except Exception as e:
+        logger.error(f"OpenAI error: {e}")
+        ai_reply = "⚠️ Sorry, I had trouble connecting to AI. Try again later."
 
-def start(update: Update, context):
-    update.message.reply_text("🤖 Hello! ScamShield bot is active.")
+    context.bot.send_message(chat_id=update.effective_chat.id, text=ai_reply)
 
-def upgrade(update: Update, context):
-    update.message.reply_text("⚡ Upgrade option coming soon.")
-
-def handle_message(update: Update, context):
-    text = update.message.text
-    update.message.reply_text(f"✅ You said: {text}")
-
-
+# Register commands & handlers
 dispatcher.add_handler(CommandHandler("start", start))
 dispatcher.add_handler(CommandHandler("upgrade", upgrade))
 dispatcher.add_handler(MessageHandler(Filters.text & ~Filters.command, handle_message))
 
+# === Webhook Routes ===
+@app.route("/")
+def home():
+    return "✅ ScamShield AI bot is running!"
 
-# === Webhook route ===
-@app.route(f"/webhook/{TOKEN}", methods=["POST"])
+@app.route(f"/webhook/{BOT_TOKEN}", methods=["POST"])
 def webhook():
-    update = Update.de_json(request.get_json(force=True), bot)
+    update = Update.de_json(request.get_json(force=True), updater.bot)
     dispatcher.process_update(update)
-    return "ok"
+    return "OK", 200
 
+# === Set webhook on startup ===
+@app.before_first_request
+def register_webhook():
+    webhook_url = f"https://{os.environ['RENDER_EXTERNAL_HOSTNAME']}/webhook/{BOT_TOKEN}"
+    success = updater.bot.set_webhook(webhook_url)
+    logger.info(f"Registering webhook to: {webhook_url}")
+    logger.info(f"bot.set_webhook returned: {success}")
 
-# === Reset webhook manually (optional helper) ===
-@app.route("/reset-webhook", methods=["GET"])
-def reset_webhook():
-    requests.get(f"https://api.telegram.org/bot{TOKEN}/deleteWebhook")
-    result = set_webhook()
-    return {"status": "Webhook reset", "result": result}
-
-
-# === Root check ===
-@app.route("/", methods=["GET"])
-def index():
-    return "✅ ScamShield bot is running!"
-
-
-# === Run ===
+# === Run Flask App ===
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=10000)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
