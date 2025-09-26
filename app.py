@@ -1,80 +1,110 @@
 import os
 import logging
+import traceback
 from flask import Flask, request
-from telegram import Update
-from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, CallbackContext, Dispatcher
+from telegram import Bot, Update
+from telegram.ext import Dispatcher, CommandHandler, MessageHandler, Filters, CallbackContext
 import openai
 
+# -------------------------------------------------
 # Logging setup
-logging.basicConfig(level=logging.INFO)
+# -------------------------------------------------
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
+)
 logger = logging.getLogger("scamshield")
 
-# === ENV VARS ===
-BOT_TOKEN = os.environ.get("TG_BOT_TOKEN") or os.environ.get("TELEGRAM_TOKEN")
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
+# -------------------------------------------------
+# Environment variables
+# -------------------------------------------------
+TG_TOKEN = os.environ.get("TG_BOT_TOKEN") or os.environ.get("TELEGRAM_TOKEN")
+OPENAI_KEY = os.environ.get("OPENAI_API_KEY")
 
-if not BOT_TOKEN or not OPENAI_API_KEY:
-    logger.error("Missing env vars: TG_BOT_TOKEN / TELEGRAM_TOKEN, OPENAI_API_KEY")
-    raise SystemExit("❌ Missing required environment variables.")
+if not TG_TOKEN:
+    logger.error("Missing Telegram token (TG_BOT_TOKEN or TELEGRAM_TOKEN).")
+if not OPENAI_KEY:
+    logger.error("Missing OpenAI API key (OPENAI_API_KEY).")
 
-openai.api_key = OPENAI_API_KEY
+bot = Bot(token=TG_TOKEN)
+openai.api_key = OPENAI_KEY
 
-# === Flask App ===
+# -------------------------------------------------
+# Flask app
+# -------------------------------------------------
 app = Flask(__name__)
+dispatcher = Dispatcher(bot, None, workers=0, use_context=True)
 
-# === Telegram Bot Setup ===
-updater = Updater(token=BOT_TOKEN, use_context=True)
-dispatcher: Dispatcher = updater.dispatcher
 
-# === Handlers ===
+# -------------------------------------------------
+# Command Handlers
+# -------------------------------------------------
 def start(update: Update, context: CallbackContext):
-    update.message.reply_text("👋 Hi! I’m ScamShield AI. Send me any message and I’ll check if it looks suspicious or just chat with you smartly.")
+    update.message.reply_text("👋 ScamShield AI is live and protecting you!")
 
-def upgrade(update: Update, context: CallbackContext):
-    update.message.reply_text("⚡ Upgrade feature coming soon! (Stripe config needed).")
 
+def upgrade_cmd(update: Update, context: CallbackContext):
+    update.message.reply_text("⚡ Upgrade feature coming soon!")
+
+
+# -------------------------------------------------
+# AI Message Handler
+# -------------------------------------------------
 def handle_message(update: Update, context: CallbackContext):
-    user_message = update.message.text
+    text = update.message.text
+    logger.info(f"User said: {text}")
+
     try:
-        # Call OpenAI for AI response
         response = openai.ChatCompletion.create(
             model="gpt-3.5-turbo",
-            messages=[
-                {"role": "system", "content": "You are ScamShield AI, a helpful assistant that warns about scams and also chats like a smart friend."},
-                {"role": "user", "content": user_message}
-            ]
+            messages=[{"role": "user", "content": text}],
         )
-        ai_reply = response["choices"][0]["message"]["content"]
+        reply = response.choices[0].message.content.strip()
     except Exception as e:
-        logger.error(f"OpenAI error: {e}")
-        ai_reply = "⚠️ Sorry, I had trouble connecting to AI. Try again later."
+        logger.error("OpenAI error: %s", e)
+        logger.error(traceback.format_exc())
+        reply = f"⚠️ AI error: {e}"
 
-    context.bot.send_message(chat_id=update.effective_chat.id, text=ai_reply)
+    update.message.reply_text(reply)
 
-# Register commands & handlers
+
+# -------------------------------------------------
+# Register Handlers
+# -------------------------------------------------
 dispatcher.add_handler(CommandHandler("start", start))
-dispatcher.add_handler(CommandHandler("upgrade", upgrade))
+dispatcher.add_handler(CommandHandler("upgrade", upgrade_cmd))
 dispatcher.add_handler(MessageHandler(Filters.text & ~Filters.command, handle_message))
 
-# === Webhook Routes ===
+
+# -------------------------------------------------
+# Routes
+# -------------------------------------------------
 @app.route("/")
 def home():
-    return "✅ ScamShield AI bot is running!"
+    return "ScamShield bot is running!"
 
-@app.route(f"/webhook/{BOT_TOKEN}", methods=["POST"])
+
+@app.route(f"/webhook/{TG_TOKEN}", methods=["POST"])
 def webhook():
-    update = Update.de_json(request.get_json(force=True), updater.bot)
+    update = Update.de_json(request.get_json(force=True), bot)
     dispatcher.process_update(update)
-    return "OK", 200
+    return "ok"
 
-# === Set webhook on startup ===
-@app.before_first_request
-def register_webhook():
-    webhook_url = f"https://{os.environ['RENDER_EXTERNAL_HOSTNAME']}/webhook/{BOT_TOKEN}"
-    success = updater.bot.set_webhook(webhook_url)
-    logger.info(f"Registering webhook to: {webhook_url}")
-    logger.info(f"bot.set_webhook returned: {success}")
 
-# === Run Flask App ===
+# Reset webhook manually if needed
+@app.route("/reset", methods=["GET"])
+def reset_webhook():
+    bot.delete_webhook()
+    success = bot.set_webhook(url=f"https://{os.environ.get('RENDER_EXTERNAL_HOSTNAME')}/webhook/{TG_TOKEN}")
+    return f"Webhook reset: {success}"
+
+
+# -------------------------------------------------
+# Startup
+# -------------------------------------------------
 if __name__ == "__main__":
+    url = f"https://{os.environ.get('RENDER_EXTERNAL_HOSTNAME')}/webhook/{TG_TOKEN}"
+    bot.delete_webhook()
+    success = bot.set_webhook(url=url)
+    logger.info(f"Registering webhook to: {url} (success={success})")
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
