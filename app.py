@@ -1,127 +1,120 @@
 import os
 import json
 import logging
-from datetime import datetime, timedelta
-from flask import Flask, request
+import stripe
 import telegram
+from telegram.ext import (
+    Application, CommandHandler, MessageHandler, filters
+)
+from flask import Flask, request
 
-# ================== CONFIG ==================
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
-BASE_URL = os.environ.get("BASE_URL")  # e.g. https://scamshield-bot.onrender.com
-ADMIN_IDS = os.environ.get("ADMIN_IDS", "")  # comma separated IDs
+# ---------------- Logging ---------------- #
+logging.basicConfig(level=logging.INFO)
+
+# ---------------- Env Vars ---------------- #
+BOT_TOKEN = os.getenv("TELEGRAM_TOKEN")
+STRIPE_SECRET_KEY = os.getenv("Stripe_secret_key")
+STRIPE_PRICE_ID = os.getenv("Stripe_price_ID")
+STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET")
+BASE_URL = os.getenv("BASE_URL")
+ADMIN_IDS = os.getenv("ADMIN_IDS", "").split(",")
 
 if not BOT_TOKEN:
-    raise ValueError("❌ BOT_TOKEN missing in Render environment")
+    raise ValueError("❌ TELEGRAM_TOKEN missing in Render environment")
 
+if not STRIPE_SECRET_KEY:
+    raise ValueError("❌ Stripe_secret_key missing in Render environment")
+
+# ---------------- Telegram Bot ---------------- #
 bot = telegram.Bot(token=BOT_TOKEN)
+
+# ---------------- Flask for Stripe Webhook ---------------- #
 app = Flask(__name__)
+stripe.api_key = STRIPE_SECRET_KEY
 
-# ================== FILE HELPERS ==================
-USERS_FILE = "users.json"
-PROMO_FILE = "promo_codes.json"
+# ---------------- Promo Codes ---------------- #
+PROMO_CODES_FILE = "promo_codes.json"
 
-def load_users():
-    if os.path.exists(USERS_FILE):
-        with open(USERS_FILE, "r") as f:
-            return json.load(f)
-    return {}
+if not os.path.exists(PROMO_CODES_FILE):
+    with open(PROMO_CODES_FILE, "w") as f:
+        json.dump({"FREE30": {"days": 30}}, f)
 
-def save_users(users):
-    with open(USERS_FILE, "w") as f:
-        json.dump(users, f, indent=2)
+with open(PROMO_CODES_FILE) as f:
+    PROMO_CODES = json.load(f)
 
-def load_promos():
-    if os.path.exists(PROMO_FILE):
-        with open(PROMO_FILE, "r") as f:
-            return json.load(f)
-    return {}
 
-# ================== USER PREMIUM ==================
-def is_premium(user_id):
-    users = load_users()
-    user = users.get(str(user_id), {})
-    exp = user.get("premium_until")
-    if exp:
-        return datetime.fromisoformat(exp) > datetime.utcnow()
-    return False
-
-def add_premium(user_id, days):
-    users = load_users()
-    uid = str(user_id)
-    now = datetime.utcnow()
-    exp = now + timedelta(days=days)
-
-    if uid in users and users[uid].get("premium_until"):
-        old_exp = datetime.fromisoformat(users[uid]["premium_until"])
-        if old_exp > now:
-            exp = old_exp + timedelta(days=days)
-
-    users[uid] = {"premium_until": exp.isoformat()}
-    save_users(users)
-
-# ================== COMMAND HANDLERS ==================
-def handle_start(chat_id):
-    bot.send_message(
-        chat_id=chat_id,
-        text="👋 Welcome to ScamShield Bot!\nSend me any message and I'll analyze it.\n\n"
-             "Use /upgrade to get premium features.\nUse /redeem CODE if you have a promo code."
+# ---------------- Handlers ---------------- #
+async def start(update, context):
+    await update.message.reply_text(
+        "👋 ScamShield AI — paste a suspicious message and I'll check it.\n\n"
+        "Free users: 10/day. Upgrade for unlimited checks.\n\n"
+        f"Subscribe: {BASE_URL}/subscribe?telegram_id={update.message.from_user.id}\n\n"
+        "Use /upgrade for one-step checkout, or /status to see your plan."
     )
 
-def handle_upgrade(chat_id):
-    bot.send_message(
-        chat_id=chat_id,
-        text="💎 To upgrade, please use a promo code (/redeem CODE)."
-    )
 
-def handle_redeem(chat_id, code):
-    promos = load_promos()
-    code_data = promos.get(code.upper())
+async def upgrade(update, context):
+    try:
+        checkout = stripe.checkout.Session.create(
+            payment_method_types=["card"],
+            mode="subscription",
+            line_items=[{"price": STRIPE_PRICE_ID, "quantity": 1}],
+            success_url=f"{BASE_URL}/success?session_id={{CHECKOUT_SESSION_ID}}",
+            cancel_url=f"{BASE_URL}/cancel",
+            metadata={"telegram_id": update.message.from_user.id}
+        )
+        await update.message.reply_text(f"💳 Upgrade here: {checkout.url}")
+    except Exception as e:
+        await update.message.reply_text(f"⚠️ Payment link error: {str(e)}")
 
-    if not code_data:
-        bot.send_message(chat_id=chat_id, text="❌ Invalid promo code.")
+
+async def redeem(update, context):
+    if len(context.args) != 1:
+        await update.message.reply_text("❌ Usage: /redeem CODE")
         return
 
-    add_premium(chat_id, code_data["days"])
-    bot.send_message(
-        chat_id=chat_id,
-        text=f"✅ Promo applied: {code_data['description']}.\n"
-             f"Enjoy {code_data['days']} days of premium!"
-    )
+    code = context.args[0].upper()
+    if code in PROMO_CODES:
+        days = PROMO_CODES[code]["days"]
+        await update.message.reply_text(f"✅ Promo code applied! {days} days premium unlocked.")
+    else:
+        await update.message.reply_text("❌ Invalid promo code.")
 
-# ================== FLASK WEBHOOK ==================
-@app.route(f"/webhook/{BOT_TOKEN}", methods=["POST"])
-def webhook():
-    update = telegram.Update.de_json(request.get_json(force=True), bot)
 
-    if update.message:
-        chat_id = update.message.chat_id
-        text = update.message.text or ""
+# ---------------- Flask Route ---------------- #
+@app.route("/webhook", methods=["POST"])
+def stripe_webhook():
+    payload = request.data
+    sig_header = request.headers.get("Stripe-Signature")
 
-        if text.startswith("/start"):
-            handle_start(chat_id)
-        elif text.startswith("/upgrade"):
-            handle_upgrade(chat_id)
-        elif text.startswith("/redeem"):
-            parts = text.split()
-            if len(parts) > 1:
-                handle_redeem(chat_id, parts[1])
-            else:
-                bot.send_message(chat_id=chat_id, text="⚠️ Usage: /redeem CODE")
-        else:
-            if is_premium(chat_id):
-                bot.send_message(chat_id=chat_id, text=f"🔎 Scam analysis result for:\n{text}\n\n✅ Safe.")
-            else:
-                bot.send_message(chat_id=chat_id, text="⚠️ You need premium to analyze messages.\nUse /upgrade.")
-    return "ok"
+    try:
+        event = stripe.Webhook.construct_event(
+            payload, sig_header, STRIPE_WEBHOOK_SECRET
+        )
+    except Exception as e:
+        return {"error": str(e)}, 400
 
-@app.route("/")
-def home():
-    return "✅ ScamShield Bot is running!"
+    if event["type"] == "checkout.session.completed":
+        session = event["data"]["object"]
+        telegram_id = session["metadata"]["telegram_id"]
+        bot.send_message(chat_id=telegram_id, text="🎉 Payment successful! Premium activated.")
 
-# ================== STARTUP ==================
+    return {"status": "ok"}
+
+
+# ---------------- Main ---------------- #
+def main():
+    application = Application.builder().token(BOT_TOKEN).build()
+
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("upgrade", upgrade))
+    application.add_handler(CommandHandler("redeem", redeem))
+
+    application.run_polling()
+
+
 if __name__ == "__main__":
-    # Register webhook each start
-    url = f"{BASE_URL}/webhook/{BOT_TOKEN}"
-    bot.set_webhook(url)
-    logging.info(f"Webhook set to {url}")
-    app.run(host="0.0.0.0", port=10000)
+    import threading
+
+    threading.Thread(target=lambda: app.run(host="0.0.0.0", port=5000)).start()
+    main()
