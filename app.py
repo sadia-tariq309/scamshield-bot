@@ -1,5 +1,5 @@
 # app.py
-# ScamShield Bot: Telegram webhook bot + rule-based scam detector + premium (Stripe test mode) + SQLite
+# ScamShield bot with premium, promo codes, and Stripe test mode
 
 import os
 import re
@@ -11,7 +11,7 @@ from datetime import datetime, date, timedelta
 from flask import Flask, request, jsonify, redirect
 import stripe
 import openai
-import telegram
+from telegram import Bot, Update, ParseMode
 from telegram.ext import Dispatcher, CommandHandler, MessageHandler, Filters
 
 # ---------------- logging ----------------
@@ -19,22 +19,21 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("scamshield")
 
 # ---------------- config/env ----------------
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN") or os.getenv("TG_BOT_TOKEN")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 if not TELEGRAM_TOKEN:
-    raise SystemExit("❌ TELEGRAM_TOKEN is missing in Render environment!")
+    raise SystemExit("❌ Missing TELEGRAM_TOKEN")
 
-BASE_URL = os.getenv("BASE_URL")  # your Render URL
+BASE_URL = os.getenv("BASE_URL")
 OPENAI_KEY = os.getenv("OPENAI_API_KEY")
 DAILY_LIMIT = int(os.getenv("DAILY_LIMIT", "10"))
 
 STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY")
 STRIPE_PRICE_ID = os.getenv("STRIPE_PRICE_ID")
 STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET")
+ADMIN_IDS = os.getenv("ADMIN_IDS", "").split(",")
 
 if OPENAI_KEY:
     openai.api_key = OPENAI_KEY
-else:
-    logger.info("OPENAI_API_KEY not set — LLM fallback disabled.")
 
 if STRIPE_SECRET_KEY:
     stripe.api_key = STRIPE_SECRET_KEY
@@ -68,7 +67,7 @@ def set_premium(telegram_id, days=30):
     """, (str(telegram_id), until))
     conn.commit()
     conn.close()
-    logger.info("✅ Premium set for %s until %s", telegram_id, until)
+    logger.info("Set premium for %s until %s", telegram_id, until)
 
 def is_premium(telegram_id):
     conn = sqlite3.connect(DB_FILE)
@@ -85,6 +84,24 @@ def is_premium(telegram_id):
         except Exception:
             return bool(is_p)
     return bool(is_p)
+
+# ---------------- promo codes ----------------
+PROMO_FILE = "promo_codes.json"
+
+def load_promo_codes():
+    try:
+        with open(PROMO_FILE, "r") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+def redeem_promo(user_id, code):
+    codes = load_promo_codes()
+    if code not in codes:
+        return False, "❌ Invalid promo code."
+    days = codes[code]
+    set_premium(user_id, days=days)
+    return True, f"🎉 Promo applied! You are premium for {days} days."
 
 # ---------------- usage limits ----------------
 USAGE_FILE = "usage_counts.json"
@@ -121,12 +138,13 @@ def check_and_increment_usage(user_id):
     save_usage(data)
     return True, entry["count"]
 
-# ---------------- rule-based scam detector ----------------
+# ---------------- scam analyzer ----------------
 SUSPICIOUS_KEYWORDS = [
     r"wire transfer", r"western union", r"bank transfer", r"send money",
-    r"urgent", r"verify your account", r"click the link", r"limited time",
-    r"winner", r"congratulations", r"prize", r"lottery", r"claim now",
-    r"password", r"account suspended", r"deposit", r"loan", r"final notice"
+    r"urgent", r"act now", r"verify your account", r"click the link",
+    r"limited time", r"winner", r"congratulations", r"prize", r"lottery",
+    r"claim now", r"password", r"account suspended", r"deposit", r"loan",
+    r"final notice", r"verify identity"
 ]
 URL_SHORTENERS = r"(bit\.ly|tinyurl|t\.co|goo\.gl|ow\.ly|tiny\.cc|is\.gd|buff\.ly)"
 
@@ -150,7 +168,7 @@ def analyze_text_rule_based(text):
 
     if re.search(r"\$\s?\d{2,}", text) or re.search(r"\d+\s?USD", text, re.I):
         score += 12
-        reasons.append("Mentions money")
+        reasons.append("Mentions money or payment")
 
     if re.search(r"!!+|!!!", text):
         score += 8
@@ -161,19 +179,26 @@ def analyze_text_rule_based(text):
         reasons.append("Many uppercase characters")
 
     score = min(100, int(score))
-    verdict = "High" if score >= 60 else "Medium" if score >= 30 else "Low"
-    advice = (
-        "Do NOT click links or reply." if verdict == "High" else
-        "Be cautious, verify sender." if verdict == "Medium" else
-        "Appears low risk, but stay alert."
-    )
+    if score >= 60:
+        verdict = "High"
+        advice = "Do NOT click links or reply. Verify independently."
+    elif score >= 30:
+        verdict = "Medium"
+        advice = "Be cautious — check sender identity and links."
+    else:
+        verdict = "Low"
+        advice = "Appears low risk, but always verify."
+
     return {
-        "verdict": verdict, "score": score, "reasons": reasons[:8],
-        "advice": advice, "explain": f"Rule-based score {score}/100"
+        "verdict": verdict,
+        "score": score,
+        "reasons": reasons[:8],
+        "advice": advice,
+        "explain": f"Rule-based score {score}/100"
     }
 
 # ---------------- OpenAI fallback ----------------
-AMBIGUOUS_LOW, AMBIGUOUS_HIGH = 15, 60
+AMBIG_LOW, AMBIG_HIGH = 15, 60
 
 def analyze_with_openai(text):
     if not OPENAI_KEY:
@@ -182,125 +207,107 @@ def analyze_with_openai(text):
         resp = openai.ChatCompletion.create(
             model="gpt-3.5-turbo",
             messages=[
-                {"role": "system", "content": "You are ScamShield. Short and precise."},
-                {"role": "user", "content": f"Analyze:\n\n{text}"}
+                {"role": "system", "content": "You are ScamShield, short and precise."},
+                {"role": "user", "content": f"Analyze this message:\n\n{text}"}
             ],
-            temperature=0.0, max_tokens=300,
+            temperature=0.0,
+            max_tokens=300,
         )
         return {"ok": True, "raw": resp["choices"][0]["message"]["content"].strip()}
     except Exception as e:
-        logger.error("OpenAI error: %s", e)
-        return {"error": "openai_error"}
+        return {"error": "openai_error", "message": str(e)}
 
-# ---------------- Telegram bot + Flask ----------------
-bot = telegram.Bot(token=TELEGRAM_TOKEN)
+# ---------------- Telegram bot ----------------
+bot = Bot(token=TELEGRAM_TOKEN)
 dispatcher = Dispatcher(bot, None, workers=4, use_context=True)
 app = Flask(__name__)
 
-# commands
 def cmd_start(update, context):
     uid = update.message.from_user.id
-    link = f"{BASE_URL.rstrip('/')}/subscribe?telegram_id={uid}"
-    update.message.reply_text(
-        f"👋 ScamShield AI\nSend any suspicious message.\n\n"
-        f"Free: {DAILY_LIMIT}/day. Upgrade for unlimited.\n"
-        f"👉 [Subscribe here]({link})", parse_mode="Markdown")
+    text = (f"👋 ScamShield AI — paste a suspicious message and I'll check it.\n"
+            f"Free users: {DAILY_LIMIT}/day. Upgrade for unlimited.\n\n"
+            f"🔑 Use /redeem CODE if you have a promo code.\n"
+            f"💳 Or subscribe here:\n{BASE_URL}/subscribe?telegram_id={uid}")
+    update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
 
 def cmd_help(update, context):
-    update.message.reply_text("Send text to analyze. Use /subscribe to get premium.")
+    update.message.reply_text("Send a message to analyze. Use /redeem CODE or /subscribe to upgrade.")
 
 def cmd_subscribe(update, context):
     uid = update.message.from_user.id
-    link = f"{BASE_URL.rstrip('/')}/subscribe?telegram_id={uid}"
-    update.message.reply_text(f"👉 Subscribe here: {link}")
+    link = f"{BASE_URL}/subscribe?telegram_id={uid}"
+    update.message.reply_text(f"Subscribe here: {link}")
+
+def cmd_redeem(update, context):
+    uid = update.message.from_user.id
+    if not context.args:
+        update.message.reply_text("Usage: /redeem CODE")
+        return
+    code = context.args[0].strip()
+    ok, msg = redeem_promo(uid, code)
+    update.message.reply_text(msg)
 
 def handle_update(update, context):
-    uid = update.message.from_user.id
-    text = (update.message.text or "").strip()
-    if not text:
-        return update.message.reply_text("Please send text.")
-
-    ok, _ = check_and_increment_usage(uid)
-    if not ok:
-        return update.message.reply_text("Daily limit reached. Use /subscribe to upgrade.")
-
-    rule = analyze_text_rule_based(text)
-    score = rule["score"]
-
-    if AMBIGUOUS_LOW < score < AMBIGUOUS_HIGH:
-        ai = analyze_with_openai(text)
-        if ai.get("ok"):
-            return update.message.reply_text(ai["raw"])
-
-    update.message.reply_text(format_result(rule), parse_mode="Markdown")
+    try:
+        uid = update.message.from_user.id
+        text = (update.message.text or "").strip()
+        if not text:
+            update.message.reply_text("Please send text.")
+            return
+        ok, count = check_and_increment_usage(uid)
+        if not ok:
+            update.message.reply_text(f"Daily limit reached ({DAILY_LIMIT}). Use /redeem or /subscribe.")
+            return
+        rule = analyze_text_rule_based(text)
+        score = rule["score"]
+        if AMBIG_LOW < score < AMBIG_HIGH:
+            ai = analyze_with_openai(text)
+            if ai.get("ok"):
+                update.message.reply_text(ai["raw"])
+                return
+        update.message.reply_text(format_result(rule), parse_mode=ParseMode.MARKDOWN)
+    except Exception:
+        update.message.reply_text("⚠️ Error occurred.")
 
 def format_result(parsed):
-    emoji = {"High": "⚠️", "Medium": "❗", "Low": "✅"}.get(parsed["verdict"], "ℹ️")
-    msg = f"{emoji} *Verdict:* {parsed['verdict']} (score {parsed['score']}/100)\n"
-    if parsed["reasons"]:
-        msg += "\n*Flags:* " + ", ".join(parsed["reasons"][:5])
-    msg += f"\n\n*Advice:* {parsed['advice']}\n_{parsed['explain']}_"
-    return msg
+    verdict = parsed.get("verdict", "Unknown")
+    score = parsed.get("score", 0)
+    reasons = parsed.get("reasons", [])
+    advice = parsed.get("advice", "")
+    explain = parsed.get("explain", "")
+    emoji = {"High": "⚠️", "Medium": "❗", "Low": "✅"}.get(verdict, "ℹ️")
+    body = f"{emoji} *Verdict:* {verdict} _(score: {score}/100)_\n"
+    if reasons:
+        body += "\n*Reasons:*"
+        for r in reasons:
+            body += f"\n• {r}"
+    body += f"\n\n*Advice:* {advice}\n_{explain}_"
+    return body
 
-# register handlers
+# handlers
 dispatcher.add_handler(CommandHandler("start", cmd_start))
 dispatcher.add_handler(CommandHandler("help", cmd_help))
 dispatcher.add_handler(CommandHandler("subscribe", cmd_subscribe))
+dispatcher.add_handler(CommandHandler("redeem", cmd_redeem))
 dispatcher.add_handler(MessageHandler(Filters.text & ~Filters.command, handle_update))
 
 # ---------------- webhook helpers ----------------
 def build_webhook_url():
-    base = BASE_URL.rstrip("/") if BASE_URL else f"https://{os.environ.get('RENDER_EXTERNAL_HOSTNAME')}"
-    return f"{base}/webhook/{TELEGRAM_TOKEN}"
+    return f"{BASE_URL.rstrip('/')}/webhook/{TELEGRAM_TOKEN}"
 
 def register_webhook():
     url = build_webhook_url()
     bot.delete_webhook()
-    ok = bot.set_webhook(url=url)
-    logger.info("Webhook set: %s", ok)
-
-# ---------------- Stripe ----------------
-@app.route("/subscribe")
-def subscribe():
-    tg = request.args.get("telegram_id")
-    if not STRIPE_PRICE_ID or not STRIPE_SECRET_KEY:
-        return "Stripe not configured", 500
-    session = stripe.checkout.Session.create(
-        payment_method_types=["card"],
-        line_items=[{"price": STRIPE_PRICE_ID, "quantity": 1}],
-        mode="subscription",
-        success_url=f"{BASE_URL.rstrip('/')}/success",
-        cancel_url=f"{BASE_URL.rstrip('/')}/cancel",
-        client_reference_id=str(tg) if tg else None,
-    )
-    return redirect(session.url, code=302)
-
-@app.route("/stripe-webhook", methods=["POST"])
-def stripe_webhook():
-    payload = request.data
-    sig_header = request.headers.get("Stripe-Signature")
-    event = stripe.Webhook.construct_event(payload, sig_header, STRIPE_WEBHOOK_SECRET)
-    if event["type"] == "checkout.session.completed":
-        tg = event["data"]["object"].get("client_reference_id")
-        if tg:
-            set_premium(tg, 30)
-            bot.send_message(chat_id=int(tg), text="🎉 Subscription active! You are Premium.")
-    return jsonify({"ok": True})
+    bot.set_webhook(url=url)
 
 # ---------------- Flask routes ----------------
 @app.route(f"/webhook/{TELEGRAM_TOKEN}", methods=["POST"])
 def telegram_webhook():
     data = request.get_json(force=True)
-    update = telegram.Update.de_json(data, bot)
+    update = Update.de_json(data, bot)
     dispatcher.process_update(update)
     return jsonify({"ok": True})
 
-@app.route("/reset-webhook")
-def reset_webhook():
-    ok = bot.set_webhook(url=build_webhook_url())
-    return jsonify({"ok": ok})
-
-# ---------------- start ----------------
 if __name__ == "__main__":
     register_webhook()
     port = int(os.environ.get("PORT", 10000))
